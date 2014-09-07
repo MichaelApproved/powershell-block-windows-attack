@@ -1,0 +1,202 @@
+Param([int]$minutes=2)
+# Check for IP addresses that used incorrect passwords more than $attackCount times within last $minutes and block these
+# using Windows firewall rule 'BlockAttackers'. The BlockAttackers rule must already exist.
+#
+# We'll keep $nretain ip addresses to stay within the maximum limit of 1000 for a firewall rule scope. To do so,
+# a xml dataset is being maintained.
+#
+# Author: Paul van der Elst, august 2014
+# based upon MichaelApproved  / powershell-block-windows-attack https://github.com/MichaelApproved/powershell-block-windows-attack
+#
+# Instead of using the firewall rule scope to check for new ip addresses to block, all administration is done in a
+# xml dataset. This will record all failed login attempts, blocking an ip address when the number of attacks exceeds
+# $attackCount. Also, per ip address the timestamp and count of the attack is recorded. To start using this version of the
+# script, an 'empty' xml file pointed to by $blockedips must exist, containing:
+# <?xml version="1.0" encoding="utf-8"?>
+# <blockedIPs>
+#   <blockedip>
+#     <ip>ip1</ip>
+#     <count>1</count>
+#     <timestamp>1900-01-01T00:00:00.0000000+00:00</timestamp>
+#   </blockedip>
+# </blockedIPs>
+#
+# configuration ------------------------------------------------------------------------------------------------------------------
+# max nr of existing blocked ip addresses to retain (to avoid reaching the limit of 1000 entries in a firewall rule scope):
+$nretain = 500
+# file paths:
+$lockfilepath = '.\blockBFattacks.lck'
+$logfilepath = '.\blockBFattacks.log'
+$blockedips = '.\BlockedIPs.xml'
+# block after $attackCount attempts:
+$attackCount = 2
+# end configuration --------------------------------------------------------------------------------------------------------------
+
+#Set priority high
+(Get-Process -id $pid).PriorityClass="High"
+
+# blockBFattacks.ps1 already running? This script can be triggered by an event trigger. It could be that
+# multiple attacks fire this trigger. Having multiple instances of this script running can corrupt the
+# firewall rule scope and must be avoided.
+if(Test-Path -Path $lockfilepath) {
+    try {
+        Remove-Item $lockfilepath > $null
+    }
+    catch {}
+    Finally {}
+}
+if(Test-Path -Path $lockfilepath) {
+    $info = (Get-Date).ToString()
+    $info += '	blockBFattacks locked' + ([Environment]::NewLine)
+    $info >> $logfilepath
+    exit
+}
+# set lockfile
+$lockfile = New-Item $lockfilepath -type file
+$lockfilestream = $lockfile.OpenWrite()
+
+# Log start of blockBFattacks.ps1
+$info = (Get-Date).ToString()
+$info += '	start blockBFattacks.ps1. Scanning from ' + [DateTime]::Now.AddMinutes(-1 * $minutes).ToString()
+$info >> $logfilepath
+
+# xml dataset.
+# A firewall rule scope can contain up to 1000 ip addresses, so we need to make sure we stay within this
+# range. The number of addresses to retain is set in $retain
+# When reading back the scope of a rule (RemoteAddresses), the scope is sorted. This makes it impossible 
+# to use the current RemoteAddresses to determine which entries existed in the scope for a longer period and
+# which entries are newly added. Because attacks from a particular ip address usually occurs in batches of
+# several days and than to be never seen again, the xml dataset is maintained using a timestamp for each
+# ip address allowing older entries to be removed.
+$xdocunsorted = New-Object  System.Xml.XmlDocument
+$xdoc  = New-Object  System.Xml.XmlDocument
+$xdocfile = Resolve-Path($blockedips)
+$xdocunsorted.load($xdocfile)
+# duplicatie the xml definition in $xdoc
+$xdoc = $xdocunsorted.Clone()
+# sort reversed on timestamp, result in $xdoc
+$xips = $xdocunsorted.blockedIPs.blockedip | Sort-Object timestamp -Descending
+if ($xips.Count) {
+    # $xips.Count > 0 means: $xips is an array of blockedip elements. If not, then $xips is either empty or
+    # contains only one blockedip element and $xdoc does not need to be sorted
+    for($i = 0; $i -lt $xips.Length; $i++) {
+        $f = $xdocunsorted.blockedIPs.blockedip | Where-Object { $_.ip -eq $xips[$i].ip }
+        $xdoc.blockedIPs.blockedip[$i].ip = $f.ip
+        $xdoc.blockedIPs.blockedip[$i].count = $f.count
+        $xdoc.blockedIPs.blockedip[$i].timestamp = $f.timestamp
+    }
+}
+
+# Limit nr of blocked ip addresses to $retain
+if($xdoc.blockedIPs.blockedip.Length -ge $nretain) {
+    $xdoc.blockedIPs.blockedip | Where-Object  { $xdoc.blockedIPs.blockedip.IndexOf($_) -ge $nretain } | ForEach-Object {$xdoc.blockedIPs.RemoveChild($_)} > $null
+}
+
+# Get timestamp to search from
+$DT = [DateTime]::Now.AddMinutes(-1 * $minutes) 
+
+# Get audit failure events from the security eventlog
+[array]$l = @() # force results to array
+$l = Get-EventLog -LogName 'Security' -InstanceId 4625 -After $DT | Select-Object *
+
+# Record the ip address and event-timestamp in the xml dataset
+if($l.Count) {
+
+    # clone xml element to record new elements
+    if($xdoc.BlockedIPs.ChildNodes.Count -lt 2) {
+        $xClone = $xdoc.BlockedIPs.blockedip.Clone()
+    } else {
+        $xClone = $xdoc.BlockedIPs.blockedip[0].Clone()
+    }
+    $xClone.ip = ''
+    $xClone.count = '0'
+    $xClone.timestamp = ''
+    # Loop through the events found and record new elements, including the count of attacks, in the xml dataset.
+    # New found ip addresses are also collected in $newips
+    $newips = ''
+    for($i = 0; $i -lt $l.Length; $i++) {
+        $ipfound = $l[$i].ReplacementStrings[-2]
+        $timestamp = $l[$i].TimeGenerated
+        $timestamp = (Get-Date ($timestamp) -Format o).ToString()
+        # not all 4625 events contain a valid ip address. Length $ipfound must be > 1
+        if($ipfound.Length -gt 1) {
+            $xNew = $xClone.Clone()
+            $xNew.ip = $ipfound.ToString()
+            $xNew.count = '1'
+            $xNew.timestamp = $timestamp
+            $e = $xdoc.BlockedIPs.blockedip | Where-Object { $_.ip -eq $xNew.ip }
+            if($e) {
+                if($newips.Contains($xNew.ip)) {
+                # count the nr of attacks for new found ip addresses
+                    $xNew.count = ([int]$e.count + 1).ToString()
+                    $xdoc.BlockedIPs.blockedip | Where-Object  { $_.ip -eq $xNew.ip } | ForEach-Object { $xdoc.BlockedIPs.RemoveChild($_) } > $null
+                    $xdoc.BlockedIPs.AppendChild($xNew) > $null
+                }
+                else {
+                # and count if nr times ip address found < $attackCount and a different timestamp
+                    if([int]$e.count -lt $attackCount -and $e.timestamp -ne $xNew.timestamp) {
+                        $newips += $ipfound.ToString() + ' '
+                        $xNew.count = ([int]$e.count + 1).ToString()
+                        $xdoc.BlockedIPs.blockedip | Where-Object  { $_.ip -eq $xNew.ip } | ForEach-Object { $xdoc.BlockedIPs.RemoveChild($_) } > $null
+                        $xdoc.BlockedIPs.AppendChild($xNew) > $null
+                    }
+                }
+            }
+            else {
+            # new ip
+                $newips += $ipfound.ToString() + ' '
+                $xdoc.BlockedIPs.AppendChild($xNew) > $null
+            }
+        }
+    }
+}
+
+#Get firewall object
+$fw = New-Object -ComObject hnetcfg.fwpolicy2 
+
+#Get firewall rule named 'BlockAttackers' (the rule must already exist!)
+$ar = $fw.rules | Where {$_.Name -eq 'BlockAttackers'} 
+
+if($newips -ne '') {
+    $newips = 'new ip addresses blocked: ' + $newips + ([Environment]::NewLine)
+}
+
+
+# Set firewall rule scope: block all ip addresses with a failed login count >= $attackCount
+$remoteAddresses = ''
+for($i = 0; $i -lt $xdoc.blockedIPs.blockedip.Length; $i++) {
+    if([int]$xdoc.blockedIPs.blockedip[$i].count -ge $attackCount) {
+        $remoteAddresses += $xdoc.blockedIPs.blockedip[$i].ip.ToString() + ','
+    }
+}
+if($remoteAddresses.EndsWith(',')) {
+    $remoteAddresses = $remoteAddresses.Substring(0, $remoteAddresses.Length -1)
+}
+$ar.RemoteAddresses = ''
+$ar.RemoteAddresses = $remoteAddresses
+
+# Save xmldoc reversed sorted on timestamp
+$xdocunsorted = $xdoc.Clone()
+$xips = $null
+$xips = $xdocunsorted.blockedIPs.blockedip | Sort-Object timestamp -Descending
+if ($xips.Count) {
+    for($i = 0; $i -lt $xips.Length; $i++) {
+        $f = $xdocunsorted.blockedIPs.blockedip | Where-Object { $_.ip -eq $xips[$i].ip }
+        $xdoc.blockedIPs.blockedip[$i].ip = $f.ip
+        $xdoc.blockedIPs.blockedip[$i].count = $f.count
+        $xdoc.blockedIPs.blockedip[$i].timestamp = $f.timestamp
+    }
+}
+$xdoc.Save($xdocfile)
+
+# Write to logfile
+$infoRemote = $ar.RemoteAddresses.ToString().Replace('/255.255.255.255','')
+$info = $newips + 'blocked ip addresses ' + $xdoc.blockedIPs.blockedip.Length.ToString() + ':'
+$info >> $logfilepath
+$remoteAddresses >> $logfilepath
+$info = (Get-Date).ToString() + '	end blockBFattacks.ps1' + ([Environment]::NewLine)
+$info >> $logfilepath
+
+# release lock file
+$lockfilestream.Close()
+Remove-Item $lockfilepath
