@@ -37,7 +37,7 @@ $w| %{
 
 #Write to logfile
 $t = $arRemote.Length
-if ($c -gt 1) {
+if ($c -gt 0) {
   $w| %{(Get-Date).ToString() + '	' + $_.Name >> $logPath}
   $t += $c
 }
