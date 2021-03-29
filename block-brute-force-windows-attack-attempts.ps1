@@ -1,6 +1,8 @@
 #Checks for IP addresses that used incorrect password more than 10 times
 #within 24 hours and blocks them using a firewall rule 'BlockAttackers'
 
+$logPath = '.\blocked.txt'
+
 #Check only last 24 hours
 $DT = [DateTime]::Now.AddHours(-24) 
 
@@ -23,15 +25,21 @@ $arRemote = $ar.RemoteAddresses -split(',')
 $w = $g | where {$_.Name.Length -gt 1 -and !($arRemote -contains $_.Name + '/255.255.255.255') }
 
 #Add the new IPs to firewall rule
+$c = 0
 $w| %{ 
   if ($ar.RemoteAddresses -eq '*') {
-		$ar.remoteaddresses = $_.Name
+		$ar.RemoteAddresses = $_.Name
 	}else{
-		$ar.remoteaddresses += ',' + $_.Name
+		$ar.RemoteAddresses += ',' + $_.Name
 	}
+  $c += 1
 }
 
 #Write to logfile
-if ($w.length -gt 1) {
-	$w| %{(Get-Date).ToString() + '	' + $_.Name >> '.\blocked.txt'} 
+$t = $arRemote.Length
+if ($c -gt 1) {
+  $w| %{(Get-Date).ToString() + '	' + $_.Name >> $logPath}
+  $t += $c
 }
+
+(Get-Date).ToString() + '	Summary : ' + $c + '/' + $t + ' Added ' >> $logPath
