@@ -1,14 +1,21 @@
-#Checks for IP addresses that used incorrect password more than 10 times
-#within 24 hours and blocks them using a firewall rule 'BlockAttackers'
+#Checks for IP addresses that used incorrect password more than '$blockCount' times
+#within '$lastHour' hours and blocks them using a firewall rule 'BlockAttackers'
+#'BlockAttackers' required to create manually
+
+$logPath = '.\blocked.txt'
+$logContent = ''
+$blockCount = 3
+$eventDateTime = $(Get-Date -format yyyyMMdd`-HHmmss)
+$lastHour = 24
 
 #Check only last 24 hours
-$DT = [DateTime]::Now.AddHours(-24) 
+$DT = [DateTime]::Now.AddHours(-$lastHour) 
 
 #Select Ip addresses that has audit failure 
-$l = Get-EventLog -LogName 'Security' -InstanceId 4625 -After $DT | Select-Object @{n='IpAddress';e={$_.ReplacementStrings[-2]} }
+$l = Get-EventLog -LogName 'Security' -InstanceId 4625 -After $DT | Select-Object @{n='IpAddress';e={$_.ReplacementStrings[-2]}}, TimeGenerated
 
-#Get ip adresses, that have more than 10 wrong logins
-$g = $l | group-object -property IpAddress  | where {$_.Count -gt 10} | Select -property Name 
+#Get ip adresses, that have more than $blockCount wrong logins
+$g = $l | group-object -property IpAddress | where {$_.Count -gt $blockCount}
 
 #Get firewall object
 $fw = New-Object -ComObject hnetcfg.fwpolicy2 
@@ -20,18 +27,32 @@ $ar = $fw.rules | where {$_.name -eq 'BlockAttackers'}
 $arRemote = $ar.RemoteAddresses -split(',') 
 
 #Only collect IPs that aren't already in the firewall rule
+$w = @()
 $w = $g | where {$_.Name.Length -gt 1 -and !($arRemote -contains $_.Name + '/255.255.255.255') }
 
 #Add the new IPs to firewall rule
-$w| %{ 
+$c = 0
+$w | %{ 
   if ($ar.RemoteAddresses -eq '*') {
-		$ar.remoteaddresses = $_.Name
+		$ar.RemoteAddresses = $_.Name
 	}else{
-		$ar.remoteaddresses += ',' + $_.Name
+		$ar.RemoteAddresses += ',' + $_.Name
 	}
+  $logContent += $eventDateTime + '	' + $_.Name + " as blocked " + $blockCount + " time(s) failed within " + $lastHour + " hour(s) @ " + $w.Group[0].TimeGenerated.ToString("yyyyMMdd`-HHmmss") + "`r`n"
+  $c += 1
+}
+
+#Report Summary
+if ($c -gt 0) {
+    $logContent += $eventDateTime + '	Summary : ' + $c + '/' + $t + ' Added'
+}else{
+    $logContent += $eventDateTime + '	' + $l[0].IpAddress + " as suspected @ " + $l[0].TimeGenerated.ToString("yyyyMMdd`-HHmmss")
+}
+
+#Write to eventlog when blocked
+if ($c -gt 0) {
+  Write-EventLog -LogName Application -Source "BlockRDP" -EntryType Information -EventId 0 -Category 0 -Message $logContent
 }
 
 #Write to logfile
-if ($w.length -gt 1) {
-	$w| %{(Get-Date).ToString() + '	' + $_.Name >> '.\blocked.txt'} 
-}
+$logContent >> $logPath
